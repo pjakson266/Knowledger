@@ -17,11 +17,19 @@
 (define-constant ERR_INSUFFICIENT_STAKE (err u113))
 (define-constant ERR_RESOURCE_NOT_FOUND (err u114))
 (define-constant ERR_ACHIEVEMENT_NOT_FOUND (err u115))
+(define-constant ERR_EXPERTISE_NOT_FOUND (err u116))
+(define-constant ERR_ENDORSEMENT_NOT_FOUND (err u117))
+(define-constant ERR_ALREADY_ENDORSED (err u118))
+(define-constant ERR_SELF_ENDORSEMENT (err u119))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u120))
 (define-constant MIN_BOUNTY_AMOUNT u1000000)
 (define-constant MIN_REVIEW_REWARD u100000)
 (define-constant REVIEW_THRESHOLD u3)
 (define-constant MIN_PARTNERSHIP_STAKE u500000)
 (define-constant MAX_PARTNERSHIP_SIZE u10)
+(define-constant MAX_EXPERTISE_AREAS u20)
+(define-constant MIN_ENDORSEMENT_THRESHOLD u5)
+(define-constant REPUTATION_PRECISION u10000)
 
 ;; data vars
 (define-data-var next-paper-id uint u1)
@@ -30,6 +38,8 @@
 (define-data-var next-partnership-id uint u1)
 (define-data-var next-resource-id uint u1)
 (define-data-var next-achievement-id uint u1)
+(define-data-var next-expertise-id uint u1)
+(define-data-var next-endorsement-id uint u1)
 
 ;; data maps
 (define-map papers
@@ -155,6 +165,89 @@
 
 (define-map user-partnership-count
   principal
+  uint
+)
+
+(define-map user-expertise
+  uint
+  {
+    user: principal,
+    domain: (string-ascii 100),
+    skill-level: uint,
+    verified: bool,
+    endorsement-count: uint,
+    creation-block: uint,
+    verification-block: uint
+  }
+)
+
+(define-map user-reputation
+  principal
+  {
+    total-reviews: uint,
+    accurate-reviews: uint,
+    accuracy-score: uint,
+    author-score: uint,
+    expertise-count: uint,
+    endorsement-received: uint,
+    reputation-level: uint,
+    last-updated: uint
+  }
+)
+
+(define-map expertise-endorsements
+  uint
+  {
+    expertise-id: uint,
+    endorser: principal,
+    endorsee: principal,
+    endorsement-strength: uint,
+    endorsement-block: uint,
+    verified: bool
+  }
+)
+
+(define-map review-accuracy
+  uint
+  {
+    review-id: uint,
+    reviewer: principal,
+    predicted-outcome: uint,
+    actual-outcome: uint,
+    accuracy-points: uint,
+    calculated: bool
+  }
+)
+
+(define-map expertise-verification
+  uint
+  {
+    expertise-id: uint,
+    verifier: principal,
+    verification-type: (string-ascii 50),
+    verification-data: (string-ascii 256),
+    verification-block: uint,
+    status: (string-ascii 20)
+  }
+)
+
+(define-map user-expertise-index
+  { user: principal, expertise-index: uint }
+  { expertise-id: uint }
+)
+
+(define-map user-expertise-count
+  principal
+  uint
+)
+
+(define-map domain-experts
+  { domain: (string-ascii 100), expert-index: uint }
+  { user: principal, skill-level: uint }
+)
+
+(define-map domain-expert-count
+  (string-ascii 100)
   uint
 )
 
@@ -494,6 +587,219 @@
   )
 )
 
+(define-public (declare-expertise (domain (string-ascii 100)) (skill-level uint))
+  (let
+    (
+      (expertise-id (var-get next-expertise-id))
+      (current-count (default-to u0 (map-get? user-expertise-count tx-sender)))
+      (domain-count (default-to u0 (map-get? domain-expert-count domain)))
+      (reputation (default-to 
+        { total-reviews: u0, accurate-reviews: u0, accuracy-score: u0, 
+          author-score: u0, expertise-count: u0, endorsement-received: u0, 
+          reputation-level: u0, last-updated: u0 }
+        (map-get? user-reputation tx-sender)))
+    )
+    (asserts! (and (>= skill-level u1) (<= skill-level u10)) ERR_INVALID_AMOUNT)
+    (asserts! (< current-count MAX_EXPERTISE_AREAS) ERR_INVALID_AMOUNT)
+    
+    (map-set user-expertise expertise-id
+      {
+        user: tx-sender,
+        domain: domain,
+        skill-level: skill-level,
+        verified: false,
+        endorsement-count: u0,
+        creation-block: stacks-block-height,
+        verification-block: u0
+      }
+    )
+    (map-set user-expertise-index { user: tx-sender, expertise-index: current-count } { expertise-id: expertise-id })
+    (map-set user-expertise-count tx-sender (+ current-count u1))
+    (map-set domain-experts { domain: domain, expert-index: domain-count } { user: tx-sender, skill-level: skill-level })
+    (map-set domain-expert-count domain (+ domain-count u1))
+    (map-set user-reputation tx-sender
+      (merge reputation { 
+        expertise-count: (+ (get expertise-count reputation) u1),
+        last-updated: stacks-block-height
+      })
+    )
+    (var-set next-expertise-id (+ expertise-id u1))
+    (ok expertise-id)
+  )
+)
+
+(define-public (endorse-expertise (expertise-id uint) (strength uint))
+  (let
+    (
+      (expertise (unwrap! (map-get? user-expertise expertise-id) ERR_EXPERTISE_NOT_FOUND))
+      (endorsement-id (var-get next-endorsement-id))
+      (endorser-reputation (default-to 
+        { total-reviews: u0, accurate-reviews: u0, accuracy-score: u0, 
+          author-score: u0, expertise-count: u0, endorsement-received: u0, 
+          reputation-level: u0, last-updated: u0 }
+        (map-get? user-reputation tx-sender)))
+      (endorsee-reputation (default-to 
+        { total-reviews: u0, accurate-reviews: u0, accuracy-score: u0, 
+          author-score: u0, expertise-count: u0, endorsement-received: u0, 
+          reputation-level: u0, last-updated: u0 }
+        (map-get? user-reputation (get user expertise))))
+    )
+    (asserts! (not (is-eq tx-sender (get user expertise))) ERR_SELF_ENDORSEMENT)
+    (asserts! (and (>= strength u1) (<= strength u5)) ERR_INVALID_AMOUNT)
+    (asserts! (>= (get total-reviews endorser-reputation) MIN_ENDORSEMENT_THRESHOLD) ERR_INSUFFICIENT_REPUTATION)
+    
+    (map-set expertise-endorsements endorsement-id
+      {
+        expertise-id: expertise-id,
+        endorser: tx-sender,
+        endorsee: (get user expertise),
+        endorsement-strength: strength,
+        endorsement-block: stacks-block-height,
+        verified: (>= (get reputation-level endorser-reputation) u3)
+      }
+    )
+    (map-set user-expertise expertise-id
+      (merge expertise { endorsement-count: (+ (get endorsement-count expertise) u1) })
+    )
+    (map-set user-reputation (get user expertise)
+      (merge endorsee-reputation { 
+        endorsement-received: (+ (get endorsement-received endorsee-reputation) strength),
+        last-updated: stacks-block-height
+      })
+    )
+    (var-set next-endorsement-id (+ endorsement-id u1))
+    (ok endorsement-id)
+  )
+)
+
+(define-public (verify-expertise (expertise-id uint) (verification-type (string-ascii 50)) (verification-data (string-ascii 256)))
+  (let
+    (
+      (expertise (unwrap! (map-get? user-expertise expertise-id) ERR_EXPERTISE_NOT_FOUND))
+      (verifier-reputation (default-to 
+        { total-reviews: u0, accurate-reviews: u0, accuracy-score: u0, 
+          author-score: u0, expertise-count: u0, endorsement-received: u0, 
+          reputation-level: u0, last-updated: u0 }
+        (map-get? user-reputation tx-sender)))
+      (verification-id (var-get next-expertise-id))
+    )
+    (asserts! (>= (get reputation-level verifier-reputation) u5) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (not (is-eq tx-sender (get user expertise))) ERR_SELF_ENDORSEMENT)
+    
+    (map-set expertise-verification verification-id
+      {
+        expertise-id: expertise-id,
+        verifier: tx-sender,
+        verification-type: verification-type,
+        verification-data: verification-data,
+        verification-block: stacks-block-height,
+        status: "verified"
+      }
+    )
+    (map-set user-expertise expertise-id
+      (merge expertise { 
+        verified: true,
+        verification-block: stacks-block-height
+      })
+    )
+    (ok verification-id)
+  )
+)
+
+(define-public (calculate-review-accuracy (review-id uint) (paper-outcome uint))
+  (let
+    (
+      (review (unwrap! (map-get? reviews review-id) ERR_REVIEW_NOT_FOUND))
+      (paper (unwrap! (map-get? papers (get paper-id review)) ERR_PAPER_NOT_FOUND))
+      (reviewer-reputation (default-to 
+        { total-reviews: u0, accurate-reviews: u0, accuracy-score: u0, 
+          author-score: u0, expertise-count: u0, endorsement-received: u0, 
+          reputation-level: u0, last-updated: u0 }
+        (map-get? user-reputation (get reviewer review))))
+      (predicted-score (get score review))
+      (accuracy-points (if (<= (if (> predicted-score paper-outcome) 
+                                   (- predicted-score paper-outcome) 
+                                   (- paper-outcome predicted-score)) u2) u100 u0))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (and (>= paper-outcome u1) (<= paper-outcome u10)) ERR_INVALID_AMOUNT)
+    (asserts! (>= (get review-count paper) REVIEW_THRESHOLD) ERR_INSUFFICIENT_FUNDS)
+    
+    (map-set review-accuracy review-id
+      {
+        review-id: review-id,
+        reviewer: (get reviewer review),
+        predicted-outcome: predicted-score,
+        actual-outcome: paper-outcome,
+        accuracy-points: accuracy-points,
+        calculated: true
+      }
+    )
+    (map-set user-reputation (get reviewer review)
+      (merge reviewer-reputation {
+        accurate-reviews: (if (> accuracy-points u50) 
+                            (+ (get accurate-reviews reviewer-reputation) u1) 
+                            (get accurate-reviews reviewer-reputation)),
+        accuracy-score: (/ (+ (* (get accuracy-score reviewer-reputation) (get total-reviews reviewer-reputation)) accuracy-points)
+                          (+ (get total-reviews reviewer-reputation) u1)),
+        last-updated: stacks-block-height
+      })
+    )
+    (ok accuracy-points)
+  )
+)
+
+(define-public (update-author-reputation (author principal) (paper-score uint))
+  (let
+    (
+      (author-reputation (default-to 
+        { total-reviews: u0, accurate-reviews: u0, accuracy-score: u0, 
+          author-score: u0, expertise-count: u0, endorsement-received: u0, 
+          reputation-level: u0, last-updated: u0 }
+        (map-get? user-reputation author)))
+      (current-papers (get-author-paper-count author))
+      (new-author-score (/ (+ (* (get author-score author-reputation) (- current-papers u1)) paper-score) current-papers))
+      (new-reputation-level (calculate-reputation-level 
+                              (get accuracy-score author-reputation)
+                              new-author-score
+                              (get endorsement-received author-reputation)))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (and (>= paper-score u1) (<= paper-score u10)) ERR_INVALID_AMOUNT)
+    
+    (map-set user-reputation author
+      (merge author-reputation {
+        author-score: new-author-score,
+        reputation-level: new-reputation-level,
+        last-updated: stacks-block-height
+      })
+    )
+    (ok new-reputation-level)
+  )
+)
+
+(define-public (update-reviewer-reputation (reviewer principal))
+  (let
+    (
+      (reviewer-reputation (unwrap! (map-get? user-reputation reviewer) ERR_NOT_AUTHORIZED))
+      (new-reputation-level (calculate-reputation-level 
+                              (get accuracy-score reviewer-reputation)
+                              (get author-score reviewer-reputation)
+                              (get endorsement-received reviewer-reputation)))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    
+    (map-set user-reputation reviewer
+      (merge reviewer-reputation {
+        total-reviews: (+ (get total-reviews reviewer-reputation) u1),
+        reputation-level: new-reputation-level,
+        last-updated: stacks-block-height
+      })
+    )
+    (ok new-reputation-level)
+  )
+)
+
 ;; read only functions
 (define-read-only (get-paper (paper-id uint))
   (map-get? papers paper-id)
@@ -608,4 +914,84 @@
   )
 )
 
-;; private functions
+(define-read-only (get-user-expertise (expertise-id uint))
+  (map-get? user-expertise expertise-id)
+)
+
+(define-read-only (get-user-reputation (user principal))
+  (map-get? user-reputation user)
+)
+
+(define-read-only (get-expertise-endorsement (endorsement-id uint))
+  (map-get? expertise-endorsements endorsement-id)
+)
+
+(define-read-only (get-review-accuracy (review-id uint))
+  (map-get? review-accuracy review-id)
+)
+
+(define-read-only (get-expertise-verification (verification-id uint))
+  (map-get? expertise-verification verification-id)
+)
+
+(define-read-only (get-user-expertise-by-index (user principal) (expertise-index uint))
+  (map-get? user-expertise-index { user: user, expertise-index: expertise-index })
+)
+
+(define-read-only (get-user-expertise-count (user principal))
+  (default-to u0 (map-get? user-expertise-count user))
+)
+
+(define-read-only (get-domain-expert (domain (string-ascii 100)) (expert-index uint))
+  (map-get? domain-experts { domain: domain, expert-index: expert-index })
+)
+
+(define-read-only (get-domain-expert-count (domain (string-ascii 100)))
+  (default-to u0 (map-get? domain-expert-count domain))
+)
+
+(define-read-only (get-next-expertise-id)
+  (var-get next-expertise-id)
+)
+
+(define-read-only (get-next-endorsement-id)
+  (var-get next-endorsement-id)
+)
+
+(define-read-only (calculate-reputation-level (accuracy-score uint) (author-score uint) (endorsement-score uint))
+  (let
+    (
+      (weighted-score (+ (/ (* accuracy-score u40) u100) 
+                        (/ (* author-score u40) u100) 
+                        (/ (* endorsement-score u20) u100)))
+    )
+    (if (>= weighted-score u800) u10
+      (if (>= weighted-score u700) u9
+        (if (>= weighted-score u600) u8
+          (if (>= weighted-score u500) u7
+            (if (>= weighted-score u400) u6
+              (if (>= weighted-score u300) u5
+                (if (>= weighted-score u200) u4
+                  (if (>= weighted-score u100) u3
+                    (if (>= weighted-score u50) u2
+                      (if (>= weighted-score u10) u1 u0))))))))))
+  )
+)
+
+(define-read-only (get-user-reputation-level (user principal))
+  (match (map-get? user-reputation user)
+    reputation (some (get reputation-level reputation))
+    none
+  )
+)
+
+(define-read-only (is-expert-in-domain (user principal) (domain (string-ascii 100)))
+  (let
+    (
+      (expertise-count (get-user-expertise-count user))
+    )
+    (> expertise-count u0)
+  )
+)
+
+
