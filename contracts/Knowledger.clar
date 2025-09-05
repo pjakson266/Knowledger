@@ -22,6 +22,10 @@
 (define-constant ERR_ALREADY_ENDORSED (err u118))
 (define-constant ERR_SELF_ENDORSEMENT (err u119))
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u120))
+(define-constant ERR_INVALID_CITATION (err u121))
+(define-constant ERR_SELF_CITATION_LIMIT (err u122))
+(define-constant ERR_CITATION_NOT_FOUND (err u123))
+(define-constant ERR_CITATION_EXISTS (err u124))
 (define-constant MIN_BOUNTY_AMOUNT u1000000)
 (define-constant MIN_REVIEW_REWARD u100000)
 (define-constant REVIEW_THRESHOLD u3)
@@ -30,6 +34,9 @@
 (define-constant MAX_EXPERTISE_AREAS u20)
 (define-constant MIN_ENDORSEMENT_THRESHOLD u5)
 (define-constant REPUTATION_PRECISION u10000)
+(define-constant MAX_CITATIONS_PER_PAPER u50)
+(define-constant MAX_SELF_CITATIONS u5)
+(define-constant CITATION_IMPACT_MULTIPLIER u100)
 
 ;; data vars
 (define-data-var next-paper-id uint u1)
@@ -40,6 +47,7 @@
 (define-data-var next-achievement-id uint u1)
 (define-data-var next-expertise-id uint u1)
 (define-data-var next-endorsement-id uint u1)
+(define-data-var next-citation-id uint u1)
 
 ;; data maps
 (define-map papers
@@ -249,6 +257,39 @@
 (define-map domain-expert-count
   (string-ascii 100)
   uint
+)
+
+;; Citation tracking maps
+(define-map paper-citations
+  { citing-paper: uint, cited-paper: uint }
+  {
+    citation-id: uint,
+    added-at: uint,
+    context: (string-ascii 256),
+    verified: bool
+  }
+)
+
+(define-map paper-citation-count
+  uint
+  {
+    citations-made: uint,
+    citations-received: uint,
+    self-citations: uint,
+    impact-score: uint,
+    last-updated: uint
+  }
+)
+
+(define-map citation-network
+  uint
+  {
+    paper-id: uint,
+    direct-citations: uint,
+    indirect-citations: uint,
+    citation-depth: uint,
+    network-influence: uint
+  }
 )
 
 ;; public functions
@@ -800,6 +841,108 @@
   )
 )
 
+;; Citation tracking functions
+(define-public (add-citation (citing-paper-id uint) (cited-paper-id uint) (context (string-ascii 256)))
+  (let
+    (
+      (citing-paper (unwrap! (map-get? papers citing-paper-id) ERR_PAPER_NOT_FOUND))
+      (cited-paper (unwrap! (map-get? papers cited-paper-id) ERR_PAPER_NOT_FOUND))
+      (citation-id (var-get next-citation-id))
+      (existing-citation (map-get? paper-citations { citing-paper: citing-paper-id, cited-paper: cited-paper-id }))
+      (citing-counts (default-to { citations-made: u0, citations-received: u0, self-citations: u0, impact-score: u0, last-updated: u0 } 
+                      (map-get? paper-citation-count citing-paper-id)))
+      (cited-counts (default-to { citations-made: u0, citations-received: u0, self-citations: u0, impact-score: u0, last-updated: u0 } 
+                     (map-get? paper-citation-count cited-paper-id)))
+      (is-self-citation (is-eq (get author citing-paper) (get author cited-paper)))
+    )
+    (asserts! (is-eq (get author citing-paper) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (not (is-eq citing-paper-id cited-paper-id)) ERR_INVALID_CITATION)
+    (asserts! (is-none existing-citation) ERR_CITATION_EXISTS)
+    (asserts! (< (get citations-made citing-counts) MAX_CITATIONS_PER_PAPER) ERR_INVALID_AMOUNT)
+    (asserts! (or (not is-self-citation) (< (get self-citations citing-counts) MAX_SELF_CITATIONS)) ERR_SELF_CITATION_LIMIT)
+    
+    ;; Add citation record
+    (map-set paper-citations { citing-paper: citing-paper-id, cited-paper: cited-paper-id }
+      {
+        citation-id: citation-id,
+        added-at: stacks-block-height,
+        context: context,
+        verified: false
+      }
+    )
+    
+    ;; Update citation counts
+    (map-set paper-citation-count citing-paper-id
+      (merge citing-counts {
+        citations-made: (+ (get citations-made citing-counts) u1),
+        self-citations: (if is-self-citation (+ (get self-citations citing-counts) u1) (get self-citations citing-counts)),
+        last-updated: stacks-block-height
+      })
+    )
+    
+    (map-set paper-citation-count cited-paper-id
+      (merge cited-counts {
+        citations-received: (+ (get citations-received cited-counts) u1),
+        impact-score: (+ (get impact-score cited-counts) CITATION_IMPACT_MULTIPLIER),
+        last-updated: stacks-block-height
+      })
+    )
+    
+    (var-set next-citation-id (+ citation-id u1))
+    (ok citation-id)
+  )
+)
+
+(define-public (verify-citation (citing-paper-id uint) (cited-paper-id uint))
+  (let
+    (
+      (citation (unwrap! (map-get? paper-citations { citing-paper: citing-paper-id, cited-paper: cited-paper-id }) ERR_CITATION_NOT_FOUND))
+      (verifier-reputation (default-to { total-reviews: u0, accurate-reviews: u0, accuracy-score: u0, 
+                                         author-score: u0, expertise-count: u0, endorsement-received: u0, 
+                                         reputation-level: u0, last-updated: u0 }
+                            (map-get? user-reputation tx-sender)))
+    )
+    (asserts! (>= (get reputation-level verifier-reputation) u3) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (not (get verified citation)) ERR_INVALID_CITATION)
+    
+    (map-set paper-citations { citing-paper: citing-paper-id, cited-paper: cited-paper-id }
+      (merge citation { verified: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (calculate-citation-impact (paper-id uint))
+  (let
+    (
+      (citation-counts (default-to { citations-made: u0, citations-received: u0, self-citations: u0, impact-score: u0, last-updated: u0 } 
+                        (map-get? paper-citation-count paper-id)))
+      (base-impact (get citations-received citation-counts))
+      (self-citation-penalty (/ (* (get self-citations citation-counts) base-impact) u10))
+      (adjusted-impact (if (> base-impact self-citation-penalty) (- base-impact self-citation-penalty) u0))
+      (network-data (default-to { paper-id: paper-id, direct-citations: u0, indirect-citations: u0, 
+                                  citation-depth: u0, network-influence: u0 }
+                     (map-get? citation-network paper-id)))
+    )
+    (asserts! (is-some (map-get? papers paper-id)) ERR_PAPER_NOT_FOUND)
+    
+    (map-set citation-network paper-id
+      (merge network-data {
+        direct-citations: (get citations-received citation-counts),
+        network-influence: (* adjusted-impact CITATION_IMPACT_MULTIPLIER)
+      })
+    )
+    
+    (map-set paper-citation-count paper-id
+      (merge citation-counts {
+        impact-score: (* adjusted-impact CITATION_IMPACT_MULTIPLIER),
+        last-updated: stacks-block-height
+      })
+    )
+    (ok (* adjusted-impact CITATION_IMPACT_MULTIPLIER))
+  )
+)
+
 ;; read only functions
 (define-read-only (get-paper (paper-id uint))
   (map-get? papers paper-id)
@@ -994,4 +1137,37 @@
   )
 )
 
+;; Citation tracking read-only functions
+(define-read-only (get-citation (citing-paper-id uint) (cited-paper-id uint))
+  (map-get? paper-citations { citing-paper: citing-paper-id, cited-paper: cited-paper-id })
+)
 
+(define-read-only (get-paper-citation-count (paper-id uint))
+  (map-get? paper-citation-count paper-id)
+)
+
+(define-read-only (get-citation-network (paper-id uint))
+  (map-get? citation-network paper-id)
+)
+
+(define-read-only (get-paper-impact-score (paper-id uint))
+  (match (map-get? paper-citation-count paper-id)
+    counts (some (get impact-score counts))
+    (some u0)
+  )
+)
+
+(define-read-only (get-highly-cited-papers-threshold)
+  (* CITATION_IMPACT_MULTIPLIER u10)
+)
+
+(define-read-only (is-highly-cited-paper (paper-id uint))
+  (match (get-paper-impact-score paper-id)
+    impact (>= impact (get-highly-cited-papers-threshold))
+    false
+  )
+)
+
+(define-read-only (get-next-citation-id)
+  (var-get next-citation-id)
+)
